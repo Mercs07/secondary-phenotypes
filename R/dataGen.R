@@ -48,7 +48,6 @@ normalY = function(mu,...){
 		res = rnorm(length(mu),mu,sqrt(sig2))
 	} else {	# multivariate
 		if(!is.matrix(sig2)) sig2 = diag(abs(sig2[1]),Q)
-		require(MASS)
 		res = t(apply(mu,1,mvrnorm,n=1,Sigma=sig2))
 	}
 	round(res,1)
@@ -79,7 +78,6 @@ pyGamma = function(mu,...){
 	# shp = mu*mu/(sd*sd) # do we need constant shape for this to work?
 	# rat = mu/(sd*sd)
 	res = rgamma(length(mu),shape=mu,rate = sd)
-	#print(range(res))
 	res
 }
 
@@ -89,10 +87,6 @@ pyLogis = function(mu){
   pi = 1/(1+exp(-mu))
   rbinom(length(mu),1,pi)
 }
-
-# the intercept-adjustment function (nice function but of questionable need)
-
-# Rcpp::sourceCpp("C:/Users/skm/Dropbox/2pd/source/gamma0.cpp") # findG0 is the exported function
 
 find_g0 = function(XY,gamma,ksi){
   xyg = XY%*%gamma
@@ -138,7 +132,6 @@ caseControlData = function(nCase,nControl,gamma,beta,ksi,Xname,Yname,printInfo=F
 	xb = cbind(1,Xpop)%*%beta # intercept(s) added here
 	Yf = match.fun(Yname)
 	Ypop = match.fun(y_trans)(as.matrix(Yf(xb,...)))
-	#print(paste0("col(X) = ",ncol(Xpop),"; col(y) = ",ncol(Ypop),", len(gam) = ",length(gamma)))
 	XY = cbind(Xpop,Ypop)
 	gamma[1] = find_g0(XY,gamma[-1],ksi)
 	if(printInfo) cat(paste0("Gamma intercept = ",sprintf("%.3f",gamma[1]),"\n"))
