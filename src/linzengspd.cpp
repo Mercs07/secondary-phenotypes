@@ -88,10 +88,10 @@ class lzspd {
     
 	double operator()(VecRef) const;  // log-likelihood
 	void df(VecRef,Ref<VectorXd>) const;   // gradient
-    VectorXd grad(VecRef) const;
+    // VectorXd grad(VecRef) const; // a (misguided?) attempt to differentiate w/r/to the approximate sum directly
 	void Hess(VecRef,Ref<MatrixXd>) const;  // Hessian
     MatrixXd opg(VecRef theta) const; // outer-prod. of gradients estimate of covariance (only valid @ MLE)
-    double lambda(VecRef theta) const {
+    double lambda(VecRef theta) const { // usually it's more sensible to call calcLambda directly from within other methods
         const VectorXd gamma(theta.tail(p+1));
         const VectorXd uxb(UX*theta.head(p)), uxg(UX*gamma.head(p));
         ArrayXXd ww = calcW<0,0>(uxb,uxg,theta(p),gamma(p));
@@ -167,6 +167,7 @@ double lzLL(Eigen::VectorXd theta,Eigen::MatrixXd X,Eigen::VectorXd y,Eigen::Vec
 
 // this one differentiates according to how the model's actually calculated (weighted sum)
 // as opposed to calculing derivative of the theoretical model which we numerically approximate
+/*
 VectorXd lzspd::grad(VecRef theta) const {
     VectorXd g(theta.size());
     const VectorXd beta(theta.head(p)), gamma(theta.tail(p+1));
@@ -193,6 +194,15 @@ VectorXd lzspd::grad(VecRef theta) const {
     // g(2*p+1) -= lam*((std::sqrt(2.*sigma2)*WW.col(1) + uxb*WW.col(0))/denoms).sum();//V2
 	return -(1./n)*g;
 }
+*/
+/*
+Rcpp::NumericVector grad2(Eigen::VectorXd theta,Eigen::MatrixXd X,Eigen::VectorXd y,Eigen::VectorXd d,
+    double rate,int ngq = 20){
+    const lzspd D(X,y,d,rate,ngq);
+    VectorXd gd = D.grad(theta);
+    return Rcpp::wrap(gd);
+}
+*/
 
 MatrixXd lzspd::opg(VecRef theta) const {
     const VectorXd beta(theta.head(p)), gamma(theta.tail(p+1));
@@ -222,14 +232,6 @@ MatrixXd lzspd::opg(VecRef theta) const {
     // double maxC = scoreSums.abs().maxCoeff();
     // if(maxC > n*1e-4) Rcpp::Rcout << "Warning: scores not numerically zero: sums = " << scoreSums.transpose() << std::endl;
     return scores.transpose()*scores;
-}
-
-// [[Rcpp::export]]
-Rcpp::NumericVector grad2(Eigen::VectorXd theta,Eigen::MatrixXd X,Eigen::VectorXd y,Eigen::VectorXd d,
-    double rate,int ngq = 20){
-    const lzspd D(X,y,d,rate,ngq);
-    VectorXd gd = D.grad(theta);
-    return Rcpp::wrap(gd);
 }
 
 // outer-product-of-gradients estimator of parameter covariance
@@ -363,30 +365,37 @@ Rcpp::NumericMatrix lzHess(Eigen::VectorXd theta,Eigen::MatrixXd X,Eigen::Vector
     return Rcpp::wrap(H);
 }
 
+
+///////////////////////////
+///////////////////////////
+// this section has wrapper code to calling of functions that use the
+// NR style indexing (though not every bizarre detail of their schema is pursued)
+
+// amount of extra space we need to allocate in each vector
+// to emulate 1-based indexing
 constexpr static size_t NR_OFFSET = 1;
 
+// create a matrix which can be indexed as M[i][j], 1 <= i <= nrow, 1 <= j <= ncol
 template<typename T,size_t offset>
 T** Tmatrix(const size_t nrow,const size_t ncol){
-    static_assert(std::is_fundamental<T>::value,"cannot allocate type of matrix!");
+    static_assert(std::is_fundamental<T>::value,"Invalid type for Tmatrix!");
     T **m = new T*[nrow + offset]{}; // default value initialization (to zero for numeric types)
-    m[offset] = new T[nrow*ncol + offset];
-    for(size_t rp = offset+1;rp <= nrow; ++rp) m[rp] = m[rp-1] + ncol;
+    m[offset] = new T[nrow*ncol + offset]; // data storage - note that M[0],...,M[offset-1] are dangling!!!
+    for(size_t rp = offset; rp < nrow; ++rp) m[rp+1] = m[rp] + ncol;
     return m;
 }
 
+// convenience 'typedef' for the usual case of 1-based indexing, double storage
 constexpr auto &dmatrix = Tmatrix<double,NR_OFFSET>;
 
-// copy constructor (the result does not share the same memory as the input!)
-// include an offset for compatibility with NR
+// copying from an Eigen::MatrixXd
 template<size_t offset>
 double** Matrix_copy(MatRef M){ // we can't pass as a const ref because of operator&
 	const size_t R = M.rows(), C = M.cols();
-	double** M2 = new double*[R + offset]; // pointers to each row
-	M2[offset] = new double[R*C + offset]; // the memory is all contiguous; each row pointer just points to start of each C-width segment
-	for(size_t i=offset;i<R + offset; ++i){
-		if(i > offset) M2[i] = M2[i-1] + C; // locate the next pointer @ beginning of the next row
-		for(size_t j=offset;j<C+offset;j++){ // cannot use std::copy/memcpy since we're converting from col-major to row-major
-			M2[i][j] = M(i,j); // no need to treat the MatrixXd as a raw array - causes more issues than it's worth
+    double **M2 = dmatrix(M.rows(),M.cols());
+	for(size_t i=0;i < R; ++i){
+		for(size_t j=0;j < C ;++j){ // cannot use std::copy/memcpy since we're converting from col-major to row-major
+			M2[i+offset][j+offset] = M(i,j);
 		}
 	}
 	return M2;
@@ -398,64 +407,102 @@ void freeMat(T** M){
 	delete[] M;
 }
 
+// diagnostic printing
+template<class T>
+void printMat(T **M,const size_t nrow,const size_t ncol){
+    for(size_t i=1;i<=nrow;i++){
+        for(size_t j=1;j<=ncol;j++){
+            if(M[i][j] >= 0) std::cout << " ";
+            Rcpp::Rcout << M[i][j] << ", ";
+        }
+        Rcpp::Rcout << "\b\b \n"; // back it up, back it up
+    }
+}
+
 // copy constructor for vectors. It's the caller's responsibility to free the memory
 // according to http://eigen.tuxfamily.org/dox/TopicFunctionTakingEigenTypes.html#TopicUsingRefClass
 template<size_t offset>
 double* Vector_copy(VecRef V){
 	double *res = new double[V.size() + offset];
-	if(offset > 0) std::fill(res,res + offset,0.); // this memory should not be accessed, but try to prevent any mischief/explosions
+    // indices less than 'offset' are not supposed to be accessed but there's no way of enforcing this
+	if(offset > 0) std::fill(res,res + offset,0.);
 	std::copy(V.data(),V.data() + V.size(),res + offset); // Eigen class members don't have begin() / end() members but data() good enough
 	return res;
 }
 
-/*
-// pure C implementation of Hessian matrix
+// can set the first nrow*ncol elems to zero (this is row-major so can zero out top rows, etc.)
+template<class T,size_t offset>
+void setZero(T **M,const size_t nrow,const size_t ncol){
+    static_assert(std::is_fundamental<T>::value,"unsupported matrix type");
+    T *pos0 = M[offset] + offset; // start of the data we're supposed to access
+    std::fill(pos0,pos0 + nrow*ncol,0);
+}
+
+// C implementation of Hessian matrix
 void spregn_d2logL(int n, int pX, double **X, double *Y, double *D,
     double *beta, double sigma, double *gamma, double rate, double *betaX,
     double *gammaX, double *gammaZ, double **tmpgammaZ, double **Wi, int ngq,
     double *w, double *x, double *pXi, double *lambda, double **d2theta) {
 
     static constexpr double sqrtPi = std::sqrt(3.141592654); // defining 'PI' is bad idea since Rmath.h wants to have this as macro name!
-    int i, j, k;
     const int nParam{2*pX + 4};
-    double tmp1, tmp2, tmp3, sum1{0}, sum2{0}, sum3{0}, sum4{0}, sum5{0};
-    const double sqrt2s = std::sqrt(2.0*sigma);
+    double tmp1, tmp2, tmp3, sum1, sum2, sum3, sum4, sum5;
+    const double sqrt2s = std::sqrt(2.0*sigma), gammaY = gamma[pX+2];
+    const double gammaY2 = gammaY*gammaY, sig2 = sigma*sigma, sig3 = sigma*sigma*sigma;
 
-    double* tmp4 = new double[nParam + NR_OFFSET]{}; // default zero-initialization
+    double *tmp4 = new double[nParam + NR_OFFSET]{}; // default zero-initialization
+    double *Yeps = new double[n + NR_OFFSET]{};      // linear model residuals
+    
+    for(int i=1;i<=n;++i) Yeps[i] = Y[i] - betaX[i];
+    const double sse = std::accumulate(&Yeps[1],&Yeps[1] + n,0.,[](double a,double b) -> double{ return a + b*b;}); // sum of squared errors
+
     double** Zstar = dmatrix(n,pX+2); // Zstar = (1, X, Y)
     double** tmp5 = dmatrix(nParam,nParam);
 
-    for (i=1; i<=n; i++) {
+    for (int i=1; i<=n; i++) {
         Zstar[i][1] = 1;
-        for (j=1; j<=pX; j++)
+        for (int j=1; j <= pX; j++)
             Zstar[i][j+1] = X[i][j];
         Zstar[i][pX+2] = Y[i];
     }
+    
+    // printMat(Zstar,5,pX+2);
 
-    for (j=1; j<=nParam; j++)
-        for (k=1; k<=nParam; k++)
-            d2theta[j][k] = 0;
+    setZero<double,NR_OFFSET>(d2theta,nParam,nParam);
 
-    for(i=1; i<=n; i++){
-        for (j=1; j<=pX+1; j++)
-            for (k=1; k<=j; k++)
-                d2theta[j][k] += -Zstar[i][j]*Zstar[i][k]/sigma;
-        for (k=1; k<=pX+1; k++)
-            d2theta[pX+2][k] += -(Y[i]-betaX[i])*Zstar[i][k]/pow(sigma,2);
-        d2theta[pX+2][pX+2] += 0.5/pow(sigma,2) - pow(Y[i]-betaX[i],2.0)/pow(sigma,3.0);
+    d2theta[pX+2][pX+2] = n*0.5/sig2 - sse/sig3; // can factor out initial value of sigma-sigma
 
-        tmp1 = 1.0/(1+exp(gammaZ[i]));
+    double Zij, Zjk;
+    // part I: parametric model Hessian components
+    for(int i=1; i<=n; i++) {
+        for (int j=1; j<=pX+1; j++) {
+            Zij = Zstar[i][j];
+            d2theta[pX+2][j] += -Yeps[i]*Zij/sig2;
+            for (int k=1; k<=j; k++)
+                d2theta[j][k] += -Zij*Zstar[i][k]/sigma;
+        }
+        // for (int k=1; k<=pX+1; k++)
+            //d2theta[pX+2][k] += -(Y[i]-betaX[i])*Zstar[i][k]/pow(sigma,2);
+            // d2theta[pX+2][j] += -Yeps[i]*Zstar[i][j]/sig2;
+        //d2theta[pX+2][pX+2] += 0.5/pow(sigma,2) - pow(Y[i]-betaX[i],2.0)/pow(sigma,3.0);
+
+        tmp1 = 1.0/(1 + exp(gammaZ[i]));
         tmp2 = tmp1*(1-tmp1);
-        for (j=1; j<=pX+2; j++)
-            for (k=1; k<=j; k++)
-                d2theta[pX+2+j][pX+2+k] += -tmp2*Zstar[i][j]*Zstar[i][k];
+        for (int j=1; j<=pX+2; j++){
+            Zij = Zstar[i][j];
+            for (int k=1; k<=j; k++)
+                d2theta[pX+2+j][pX+2+k] += -tmp2*Zij*Zstar[i][k];
+        }
+    }
 
-        // for (j=1; j<=nParam; j++) {
-        //     tmp4[j] = 0;
-        //     for (k=1; k<=nParam; k++)		
-        //         tmp5[j][k] = 0;
-        // }
-        for (k=1; k<=ngq; k++) {
+    // part II: profile likelihood parts
+    for(int i=1; i<=n; i++) {
+
+        setZero<double,NR_OFFSET>(tmp5,nParam,nParam);
+        std::fill(&tmp4[NR_OFFSET], &tmp4[NR_OFFSET] + nParam,0);
+        sum1=0; sum2=0; sum3=0; sum4=0; sum5=0;
+
+        for (int k=1; k<=ngq; k++) {
             tmp1 = 1.0/(1+exp(tmpgammaZ[i][k]));
             tmp2 = tmp1*(1-tmp1)*w[k]*lambda[1]/sqrtPi;
             tmp3 = tmp2*(2*tmp1-1);
@@ -465,103 +512,108 @@ void spregn_d2logL(int n, int pX, double **X, double *Y, double *D,
             sum4 += tmp3*x[k];
             sum5 += tmp3*x[k]*x[k];
         }
-    for (j=1; j<=pX+1; j++)
-        tmp4[j] = sum1*gamma[pX+2]*Zstar[i][j];
-    tmp4[pX+2] = sum2*gamma[pX+2]/sqrt2s;
+        // fill in tmp4, tmp5
+        for (int j=1; j<=pX+1; j++) {
+            Zij = Zstar[i][j];
+            tmp4[j] = sum1*gammaY*Zij;
+            tmp4[pX+2+j] = sum1*Zij;
+        }
+        tmp4[pX+2] = sum2*gammaY/sqrt2s;
+        tmp4[nParam] = sum1*betaX[i] + sum2*sqrt2s;
+            
+        for (int j=1; j<=pX+1; j++) {
+            Zij = Zstar[i][j];
+            tmp5[pX+2][j] = sum4*gammaY2 * Zij/sqrt2s;
+            tmp5[nParam][j] = (sum3*gammaY * betaX[i] + sum4*gammaY*sqrt2s + sum1) * Zij;
+            tmp5[pX+2+j][pX+2] = sum4*gammaY * Zij/sqrt2s;
+            tmp5[nParam][pX+2+j] = (sum3*betaX[i] + sum4*sqrt2s) * Zij;
+            for (int k=1; k<=j; k++){
+                Zjk = Zij * Zstar[i][k];
+                tmp5[j][k] = sum3 * gammaY2 * Zjk;
+                tmp5[pX+2+j][k] = sum3*gammaY * Zjk;
+                tmp5[pX+2+j][pX+2+k] = sum3 * Zjk;
+            }
+        }
+        tmp5[pX+2][pX+2] = sum5 * gammaY2/sqrt2s - sum2*gammaY * pow(2*sigma,-1.5);
+        tmp5[nParam][pX+2] = (gammaY/sqrt2s) * (sum4*betaX[i] + sum5*sqrt2s) + sum2/sqrt2s;
+        tmp5[nParam][nParam] = sum3*pow(betaX[i],2) + sum4*2*betaX[i]*sqrt2s + sum5*2.*sigma;
 
-    for (j=1; j<=pX+1; j++)
-        tmp4[pX+2+j] = sum1*Zstar[i][j];
-    tmp4[nParam] = sum1*betaX[i] + sum2*sqrt2s;
+        // for (k=1; k<=pX+1; k++)
+        //     tmp5[pX+2][k] = sum4*pow(gamma[pX+2],2)*Zstar[i][k]/sqrt2s;           
+        // for (j=1; j<=pX+1; j++)
+        //     for (k=1; k<=pX+1; k++)
+        //         tmp5[pX+2+j][k] = sum3*gamma[pX+2]*Zstar[i][j]*Zstar[i][k];
+        // for (k=1; k<=pX+1; k++)
+        //     tmp5[nParam][k] = (sum3*gamma[pX+2]*betaX[i] + sum4*gamma[pX+2]*sqrt2s)*Zstar[i][k];
+        // tmp5[pX+2][pX+2] = sum5*pow(gamma[pX+2],2)/sqrt2s;
+        // for (k=1; k<=pX+1; k++)
+        //     tmp5[pX+2+k][pX+2] = sum4*gamma[pX+2]*Zstar[i][k]/sqrt2s;
+        // for (j=1; j<=pX+1; j++)
+        //     for (k=1; k<=j; k++)
+        //         tmp5[pX+2+j][pX+2+k] = sum3 * Zstar[i][j]*Zstar[i][k];
+        // for (k=1; k<=pX+1; k++)
+        //     tmp5[nParam][pX+2+k] = (sum3*betaX[i] + sum4*sqrt2s) * Zstar[i][k];
+        // for (k=1; k<=pX+1; k++)
+        //     tmp5[nParam][k] += sum1*Zstar[i][k];
+        // tmp5[nParam][pX+2] += sum2/sqrt2s;
+        // tmp5[pX+2][pX+2] += -sum2*gamma[pX+2] * pow(2*sigma,-1.5);
         
-    for (j=1; j<=pX+1; j++)
-        for (k=1; k<=j; k++)
-            tmp5[j][k] = sum3*pow(gamma[pX+2],2)*Zstar[i][j]*Zstar[i][k];
-
-    for (k=1; k<=pX+1; k++)
-        tmp5[pX+2][k] = sum4*pow(gamma[pX+2],2)*Zstar[i][k]/sqrt2s;
-    
-    for (j=1; j<=pX+1; j++)
-        for (k=1; k<=pX+1; k++)
-            tmp5[pX+2+j][k] = sum3*gamma[pX+2]*Zstar[i][j]*Zstar[i][k];
-    
-    for (k=1; k<=pX+1; k++)
-        tmp5[nParam][k] = (sum3*gamma[pX+2]*betaX[i] + sum4*gamma[pX+2]*sqrt2s)*Zstar[i][k];
-    tmp5[pX+2][pX+2] = sum5*pow(gamma[pX+2],2)/sqrt2s;
-    
-    for (k=1; k<=pX+1; k++)
-        tmp5[pX+2+k][pX+2] = sum4*gamma[pX+2]*Zstar[i][k]/sqrt2s;
-    tmp5[nParam][pX+2] = (gamma[pX+2]/sqrt2s) * (sum4*betaX[i] + sum5*sqrt2s);
-    
-    for (j=1; j<=pX+1; j++)
-        for (k=1; k<=j; k++)
-            tmp5[pX+2+j][pX+2+k] = sum3*Zstar[i][j]*Zstar[i][k];
-    
-    for (k=1; k<=pX+1; k++)
-        tmp5[nParam][pX+2+k] = (sum3*betaX[i]+sum4*sqrt2s)*Zstar[i][k];
-    tmp5[nParam][nParam] = sum3*pow(betaX[i],2) + sum4*2*betaX[i]*sqrt2s + sum5*2.*sigma;
-
-    for (k=1; k<=pX+1; k++)
-        tmp5[nParam][k] += sum1*Zstar[i][k];
-    tmp5[pX+2][pX+2] += -sum2*gamma[pX+2]*pow(2*sigma,-1.5);
-    tmp5[nParam][pX+2] += sum2/sqrt2s;
-
-    for (j=1; j <= nParam; j++)
-        for (k=1; k<=j; k++)
-            d2theta[j][k] += pXi[i]*pXi[i]*tmp4[j]*tmp4[k] - pXi[i]*tmp5[j][k];
+        for (int j=1; j <= nParam; j++)
+            for (int k=1; k<=j; k++)
+                d2theta[j][k] += pXi[i]*pXi[i]*tmp4[j]*tmp4[k] - pXi[i]*tmp5[j][k];
     }
-    for (j=1; j <= nParam; j++){
-        for (k=1; k<=j; k++){
+
+    // symmetry
+    for (int j=1; j <= nParam; j++){
+        for (int k=1; k<=j; k++){
             d2theta[j][k] /= static_cast<double>(n);
             d2theta[k][j] = d2theta[j][k];
         }
     }
+    // printMat(d2theta,nParam,nParam);
     
     delete[] tmp4;
     freeMat<double,NR_OFFSET>(Zstar);
     freeMat<double,NR_OFFSET>(tmp5);
 }
 
+/*
+    To call the functions in spreg_d2logL, we need the following elements:
+    int n               sample size
+    int pX              X.cols() (p-1 relative to spd)
+    double **X          X, but WITHOUT an intercept column!
+    double *Y           y
+    double *D           d
+    double *beta        beta
+    double sigma        sigma2
+    double *gamma       gamma
+    double rate         xi
+    double *betaX       X*beta
+    double *gammaX      X*gammaX
+    double *gammaZ      cbind(1,X,Y)*gamma
+    double **tmpgammaZ  tmpgammaZ[i][j] = gammaX[i] + gamma2*(betaX[i]+sqrt(2*sigma2)*x[j])   // same as eArg in calcW above
+    double **Wi	      # this is not really a double ** - only column 1 is used
+    int ngq			  # of Gaussian quadrature points (length of w and x below)
+    double *w			  Gaussian quadrature weights
+    double *x			  Gaussian quadrature locations
+    double *pXi		  1/denoms (X_i point masses) NOTE: these are not unique!
+    double *lambda      a pointer to length-2 array, but only lambda[1] is used
+    double **d2theta    just for spregn_d2logL, the returned Hessian matrix
 */
 
-	// Given an input spd object D, we can set up all the pointers and call spreg functions:
-	/*
-	  To call the functions in spreg_d2logL, we need the following elements:
-	  int n               sample size
-	  int pX              X.cols() (p-1 relative to spd)
-	  double **X          X, but WITHOUT an intercept column!
-	  double *Y           y
-	  double *D           d
-      double *beta        beta
-	  double sigma        sigma2
-	  double *gamma       gamma
-	  double rate         xi
-	  double *betaX       X*beta
-      double *gammaX      X*gammaX
-	  double *gammaZ      cbind(1,X,Y)*gamma
-	  double **tmpgammaZ  tmpgammaZ[i][j] = gammaX[i] + gamma2*(betaX[i]+sqrt(2*sigma2)*x[j])   // same as eArg in calcW above
-	  double **Wi	      # this is not really a double ** - only column 1 is used
-	  int ngq			  # of Gaussian quadrature points (length of w and x below)
-      double *w			  Gaussian quadrature weights
-	  double *x			  Gaussian quadrature locations
-	  double *pXi		  1/denoms (X_i point masses) NOTE: these are not unique!
-	  double *lambda      a pointer to length-2 array, but only lambda[1] is used
-	  double **d2theta    just for spregn_d2logL, the returned Hessian matrix
-	*/
-
-/*
-MatrixXd spd_Hess(const lzspd& D,VecRef theta){
+MatrixXd spd_Hess(const lzspd& D,VecRef theta) {
 	VectorXd xb(D.X*theta.head(D.p)); // xBeta
 	VectorXd xg(D.X*theta.segment(D.p+1,D.p));  // xGamma
 	double gamma2 = theta(2*D.p+1), sig2 = theta(D.p);
 	MatrixXd tmpGZ = gamma2*xb*(std::sqrt(2.*sig2)*D.x).transpose(); // n x ngq
     tmpGZ.colwise() += xg;
 	ArrayXd W0 = D.calcW<0,0>(xb,xg,sig2,gamma2).col(0); // note that here we use xb, xg NOT uxb, uxg
-	const double lam = calcLambda(W0-D.xi,VectorXd::Constant(D.n,1.0)); // also note here inputs are length-n with all multiplicites==1
+	const double lam = calcLambda(W0 - D.xi,VectorXd::Constant(D.n,1.0)); // also note here inputs are length-n with all multiplicites==1
 	VectorXd piX( 1./(lam*(W0.array() - D.xi) + D.n) );
 	const int N = D.n, P = D.p-1;
+    // lots of copying...since respective matrix types are aligned differently
 	double** t_X = Matrix_copy<NR_OFFSET>(D.X.rightCols(P));
-	VectorXd myY = D.y;
-	double* t_Y = Vector_copy<NR_OFFSET>(myY);
+	double* t_Y = Vector_copy<NR_OFFSET>(D.y);
 	double* t_d = Vector_copy<NR_OFFSET>(D.d);
 	double* t_beta = Vector_copy<NR_OFFSET>(theta.head(P+1));
 	double* t_gamma = Vector_copy<NR_OFFSET>(theta.tail(P+2));
@@ -575,23 +627,18 @@ MatrixXd spd_Hess(const lzspd& D,VecRef theta){
 	double* t_Pi = Vector_copy<NR_OFFSET>(piX);
 	std::array<double,2> dumbLam = {0., lam};
     double *lamPtr = &dumbLam[0];
-	MatrixXd dumbTmp(MatrixXd::Zero(D.nParam,D.nParam));
-	double** d2theta = Matrix_copy<NR_OFFSET>(dumbTmp);
-	using rdMap = Eigen::Map<Eigen::Matrix<double,Eigen::Dynamic,Eigen::Dynamic,Eigen::RowMajor>>;  // row-major, double Map
-    MatrixXd res;
-    // call the monstrosity
-    if(false){
-        spregn_d2logL(N, P, t_X, t_Y, t_d,t_beta, sig2, t_gamma, D.xi, t_xb, t_xg,
-		    t_zg, t_tmpGZ, t_Wi, D.ngq, t_w, t_x, t_Pi, lamPtr, d2theta);
-            // convert d2theta to an Eigen::Map
-	    double* h0 = &d2theta[1][1];
-        rdMap H(h0,D.nParam,D.nParam);  // in this case, alignment doesn't matter since the matrix is square and symmetric
-        res = H;
-    } else {
-        Rcpp::Rcout << "would have called spregn_d2logL\n";
-        res = MatrixXd::Identity(D.nParam,D.nParam);
+	MatrixXd res(MatrixXd::Zero(D.nParam,D.nParam));
+	double** d2theta = Matrix_copy<NR_OFFSET>(res);
+    
+    spregn_d2logL(N, P, t_X, t_Y, t_d,t_beta, sig2, t_gamma, D.xi, t_xb, t_xg,
+        t_zg, t_tmpGZ, t_Wi, D.ngq, t_w, t_x, t_Pi, lamPtr, d2theta);
+    Rcpp::Rcout << "Fitted lambda: " << dumbLam[0] << std::endl;
+    for(int i=0; i < D.nParam;i++){
+        for(int j=0; j < D.nParam;j++){
+            res(i,j) = d2theta[i+NR_OFFSET][j+NR_OFFSET];
+        }
     }
-	// free them
+	
 	freeMat<double,NR_OFFSET>(t_X);  freeMat<double,NR_OFFSET>(t_tmpGZ);
 	freeMat<double,NR_OFFSET>(t_Wi); freeMat<double,NR_OFFSET>(d2theta);
 	delete[] t_Y;
@@ -607,7 +654,20 @@ MatrixXd spd_Hess(const lzspd& D,VecRef theta){
 	return res;
 }
 
-*/
+// [[Rcpp::export]]
+Rcpp::NumericMatrix c_hess(Eigen::VectorXd theta,Eigen::MatrixXd X,Eigen::VectorXd y,
+                           Eigen::VectorXd d,double rate,int ngq = 20) {
+    Rcpp::Rcout << "function called " << std::endl;
+    MatrixXd HH;
+    try {
+        const lzspd D(X,y,d,rate,ngq);
+        Rcpp::Rcout << "Data initialized!" << std::endl;
+        HH = spd_Hess(D,theta);
+    } catch(...) {
+        Rcpp::stop("Exception occured in c_hess...we are SO SURPRISED!");
+    }
+    return Rcpp::wrap(HH);
+}
 
 // [[Rcpp::export]]
 Rcpp::List fit_lzspd(Eigen::MatrixXd X,Eigen::VectorXd y,Eigen::VectorXd d,double rate,Eigen::VectorXd theta,
@@ -651,8 +711,9 @@ Rcpp::List fit_lzspd(Eigen::MatrixXd X,Eigen::VectorXd y,Eigen::VectorXd d,doubl
     MatrixXd out_Hess(D.nParam,D.nParam);
     D.df(mle,out_grad);
     D.Hess(mle,out_Hess);
-    // other Hessian
-    MatrixXd H2 = D.opg(mle);
+    // lots of Hessians to pick from!
+    // MatrixXd H2 = D.opg(mle);
+    // MatrixXd H3 = spd_Hess(D,mle);
     return Rcpp::List::create(
         Named("theta") = mle, // for easy reference after fitting
         Named("beta") = betaHat,
@@ -663,6 +724,7 @@ Rcpp::List fit_lzspd(Eigen::MatrixXd X,Eigen::VectorXd y,Eigen::VectorXd d,doubl
         Named("nX") = D.nx,
         Named("gradient") = out_grad,
         Named("Hessian") = out_Hess,
-        Named("Hess2") = H2
+        Named("Hess2") = D.opg(mle),
+        Named("Hess3") = spd_Hess(D,mle)
     );
 }

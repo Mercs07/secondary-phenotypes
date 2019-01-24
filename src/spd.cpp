@@ -783,6 +783,7 @@ Rcpp::List fit2pd(Rcpp::NumericMatrix xx,Rcpp::NumericMatrix yy,Rcpp::NumericVec
 
 // [[Rcpp::export]]
 int timeit(VectorXd theta,VectorXd dd,MatrixXd Y,MatrixXd X,double ksi,int ntrial = 100){
+    // crude timing of different versions of likelihood
 	const spd D(X,Y,dd,ksi);
 	auto t1 = std::chrono::high_resolution_clock::now();
 	double res = 0;
@@ -796,8 +797,7 @@ int timeit(VectorXd theta,VectorXd dd,MatrixXd Y,MatrixXd X,double ksi,int ntria
 	auto t3 = std::chrono::high_resolution_clock::now();
 	Rcpp::Rcout << "Prevent optimizing away: " << res << std::endl;
 	// Note: floating-point versions don't need explicit casting, see https://en.cppreference.com/w/cpp/chrono/duration/duration_cast
-	std::chrono::duration<double,std::milli> ts1 = t2 - t1;
-	std::chrono::duration<double,std::milli> ts2 = t3 - t2;
+	std::chrono::duration<double,std::milli> ts1 = t2 - t1, ts2 = t3 - t2;
 	Rcpp::Rcout << "Avg. time of first method (ms): " << ts1.count()/ntrial << std::endl;
 	Rcpp::Rcout << "Avg. time of second method: (ms)" << ts2.count()/ntrial << std::endl;
 	return 0;
